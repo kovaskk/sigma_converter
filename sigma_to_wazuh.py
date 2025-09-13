@@ -323,7 +323,7 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         if 'description' in sigma_rule and sigma_rule['description'] is not None:
             self.add_rule_comment(rule, "Description: " + sigma_rule['description'])
         if 'date' in sigma_rule and sigma_rule['date'] is not None:
-            self.add_rule_comment(rule, "Date: " + sigma_rule['date'])
+            self.add_rule_comment(rule, "Date: " + str(sigma_rule['date']))
         if 'status' in sigma_rule and sigma_rule['status'] is not None:
             self.add_rule_comment(rule, "Status: " + sigma_rule['status'])
         if 'id' in sigma_rule:
