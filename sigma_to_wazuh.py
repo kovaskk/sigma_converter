@@ -1123,12 +1123,12 @@ class TrackSkips(object):
             skip = True
             self.cidr += 1
             logic.append('Cidr')
-        one_of_count = condition.lower().split().count('1_of') # filter out rules with multiple 1_of's
-        if (one_of_count > 1 and 'and' in condition) or ("not 1_of" in condition):
-            skip = True
-            self.one_of_and_skips += 1
-            logic.append('more than 1_of with and')
-        return skip, "{} {}".format(message, logic)
+        # one_of_count = condition.lower().split().count('1_of') # filter out rules with multiple 1_of's
+        # if (one_of_count > 1 and 'and' in condition) or ("not 1_of" in condition):
+        #    skip = True
+        #    self.one_of_and_skips += 1
+        #    logic.append('more than 1_of with and')
+        # return skip, "{} {}".format(message, logic)
 
     def check_for_skip(self, rule, sigma_rule, detection, condition):
         """
