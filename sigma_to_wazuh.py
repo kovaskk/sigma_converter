@@ -11,6 +11,7 @@ import yaml
 from ruamel.yaml import YAML
 
 debug = False
+missing_fields = set()
 
 class Var:
     __slots__ = ("name", "neg")
@@ -70,8 +71,6 @@ class BuildRules(object):
         self.used_wazuh_ids_this_run = []  # new Wazuh rule IDs consummed this run
         self.root = self.create_root()
         self.rule_count = 0
-        # monkey patching prettify
-        # reference: https://stackoverflow.com/questions/15509397/custom-indent-width-for-beautifulsoup-prettify
         orig_prettify = bs4.BeautifulSoup.prettify
         r = re.compile(r'^(\s*)', re.MULTILINE)
 
@@ -108,17 +107,7 @@ class BuildRules(object):
         Notify.debug(self, "Function: {}".format(self.create_root.__name__))
         root = Element('group')
         root.set('name', 'sigma,')
-        self.add_header_comment(root)
         return root
-
-    def add_header_comment(self, root):
-        comment = Comment("""
-Author: Brian Kellogg
-Sigma: https://github.com/SigmaHQ/sigma
-Wazuh: https://wazuh.com
-All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master/LICENSE.Detection.Rules.md
-""")
-        root.append(comment)
 
     def update_rule_id_mappings(self, sigma_guid, wid):
         Notify.debug(self, "Function: {}".format(self.update_rule_id_mappings.__name__))
@@ -169,7 +158,9 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         if product in self.config.sections():
             if field in self.config[product]:
                 return self.config[product][field]
-        return "full_log"  # target full log if we cannot find the field
+            else:
+                missing_fields.add(field)
+        return "full_log" # target full log if we cannot find the field
 
     def if_ends_in_space(self, value, is_b64):
         """
@@ -321,22 +312,44 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         Notify.debug(self, "Function: {}".format(self.create_rule.__name__))
         level = sigma_rule['level']
         rule = self.init_rule(level, sigma_guid)
-        if 'tags' in sigma_rule:
-            self.add_mitre(rule, sigma_rule['tags'])
-        self.add_description(rule, sigma_rule['title'])
-        self.add_options(rule, level, sigma_rule['id'])
-        self.add_sources(rule, sigma_rule['logsource'])
+        self.add_rule_comment(rule, "SEVERITY LEVEL - MANUAL CHECK")
         if_group_guid = self.add_if_group_guid(rule, sigma_guid)
         if not if_group_guid:
             if_sid_guid = self.add_if_sid_guid(rule, sigma_guid)
             if not if_sid_guid and 'product' in sigma_rule['logsource']:
                 if_group = self.add_if_group(rule, sigma_rule['logsource'])
                 if not if_group:
+                    self.add_rule_comment(rule, "IF_SID - MANUAL CHECK")
                     self.add_if_sid(rule, sigma_rule['logsource'])
         return rule
 
-    def write_wazah_id_to_sigman_id(self):
-        Notify.debug(self, "Function: {}".format(self.write_wazah_id_to_sigman_id.__name__))
+    def create_child_rule(self, sigma_rule, sigma_rule_link, sigma_guid_parent, parent_rule):
+        from xml.etree.ElementTree import SubElement
+        level = sigma_rule['level']
+        rule = SubElement(self.root, 'rule')
+        try:
+            pid = int(parent_rule.get('id'))
+        except:
+            pid = int(self.rule_id)  # запасной путь
+        target = str(pid + 1)
+        while target in self.used_wazuh_ids_this_run:
+            pid += 1
+            target = str(pid + 1)
+        rule.set('id', target)
+        rule.set('level', self.get_level(level))
+        self.rule_count += 1
+        self.used_wazuh_ids_this_run.append(target)
+        self.update_rule_id_mappings(f"{sigma_guid_parent}:filter", target)
+        return rule
+
+    def finalize_rule(self, rule, sigma_rule, omit_mitre=False):
+        self.add_options(rule, sigma_rule['level'], sigma_rule['id'])
+        self.add_description(rule, sigma_rule['title'])
+        if (not omit_mitre) and ('tags' in sigma_rule):
+            self.add_mitre(rule, sigma_rule['tags'])
+
+    def write_wazuh_id_to_sigman_id(self):
+        Notify.debug(self, "Function: {}".format(self.write_wazuh_id_to_sigman_id.__name__))
         with open(self.track_rule_ids_file, 'w') as ids:
             ids.write(json.dumps(self.track_rule_ids))
                 
@@ -376,7 +389,7 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         with open(self.out_file, "w", encoding="utf-8") as file:
             file.write(xml)
 
-        self.write_wazah_id_to_sigman_id()
+        self.write_wazuh_id_to_sigman_id()
 
 
 class ParseSigmaRules(object):
@@ -657,33 +670,70 @@ class ParseSigmaRules(object):
             for k, v in d.items():
                 field, logic, is_b64 = self.convert_transforms(k, v, negate, rules, product)
                 Notify.debug(self, "Logic: {}".format(logic))
-                # if not self.is_list_of_dicts(k):
-                #     self.handle_keywords(rules, rule, sigma_rule, sigma_rule_link, product, logic, negate, is_b64)
-                #     continue
                 self.is_dict_list_or_not(logic, rules, rule, sigma_rule, sigma_rule_link, product, field, negate, is_b64)
 
     def handle_logic_paths(self, rules, sigma_rule, sigma_rule_link, logic_paths):
         Notify.debug(self, "Function: {}".format(self.handle_logic_paths.__name__))
         product = self.get_product(sigma_rule)
         logic_paths = list(filter(None, logic_paths))
+        from xml.etree.ElementTree import SubElement
+
         for path in logic_paths:
-            negate = "no"
-            rule = rules.create_rule(sigma_rule, sigma_rule_link, sigma_rule['id'])
-            Notify.debug(self, "Logic Path: {}".format(path))
-            path = list(filter(None, path))
-            for p in path:
-                if isinstance(p, collections.abc.Sequence) and not isinstance(p, str): # kludge to fix token that is an array
+            # --- раскладываем на базу и фильтры ---
+            negate_next = False
+            base_terms, filter_terms = [], []
+
+            for p in filter(None, path):
+                if isinstance(p, collections.abc.Sequence) and not isinstance(p, str):
                     p = p[0]
-                Notify.debug(self, "Token - {} : {}".format(type(p), p))
-                Notify.debug(self, "Detection Type: {}".format(type(sigma_rule['detection'])))
                 if p == "not":
-                    negate = "yes"
+                    negate_next = True
                     continue
-                self.handle_fields(rules, rule, p, negate,
-                                    sigma_rule, sigma_rule_link,
-                                    sigma_rule['detection'][p],
-                                    product)
-                negate = "no"
+                if p.lower().startswith('filter'):
+                    if p not in filter_terms:
+                        filter_terms.append(p)
+                    negate_next = False
+                else:
+                    base_terms.append((p, "yes" if negate_next else "no"))
+                    negate_next = False
+
+            # --- Родитель ---
+            parent_rule = rules.create_rule(sigma_rule, sigma_rule_link, sigma_rule['id'])
+            # поля базовой части
+            for token, neg in base_terms:
+                self.handle_fields(
+                    rules, parent_rule, token, neg,
+                    sigma_rule, sigma_rule_link,
+                    sigma_rule['detection'][token],
+                    product
+                )
+            # завершаем родителя: options -> description -> mitre
+            rules.finalize_rule(parent_rule, sigma_rule, omit_mitre=False)
+            # --- Если фильтров нет — дочернего не нужно ---
+            if not filter_terms:
+                continue
+            # --- Дочерний (единый) ---
+            child_rule = rules.create_child_rule(sigma_rule, sigma_rule_link, sigma_rule['id'], parent_rule)
+            # убрать любые чужие if_sid/if_group сразу после создания дочернего
+            self._strip_if_sid(child_rule)
+            # (если есть аналогичная функция для if_group — тоже вызовите)
+            child_rule.set('level', '0')
+            # единственный if_sid — ДО полей и в НАЧАЛО правила
+            from xml.etree.ElementTree import Element
+            parent_id = parent_rule.get('id')
+            ifsid = Element('if_sid')
+            ifsid.text = parent_id
+            child_rule.insert(0, ifsid)  # ключ: вставка перед любыми детьми
+            # поля: ВСЕ filter_*
+            for ftoken in filter_terms:
+                self.handle_fields(
+                    rules, child_rule, ftoken, "no",
+                    sigma_rule, sigma_rule_link,
+                    sigma_rule['detection'][ftoken],
+                    product
+                )
+            # финализируем дочерний: options -> description, БЕЗ mitre
+            rules.finalize_rule(child_rule, sigma_rule, omit_mitre=True)
 
     def handle_all_of(self, detections, token):
         Notify.debug(self, "Function: {}".format(self.handle_all_of.__name__))
@@ -937,6 +987,49 @@ class ParseSigmaRules(object):
             logic_paths.append(path)
         return logic_paths
 
+    def _strip_if_sid(self, rule):
+        # удалить все автоматически добавленные if_sid (и у родителя, и у ребёнка)
+        for e in list(rule):
+            if getattr(e, "tag", None) == "if_sid":
+                rule.remove(e)
+
+    def _ensure_child_id_consecutive(self, rules, parent_rule, child_rule, sigma_guid):
+        """
+        Ставим id ребёнка = parent+1, если свободно; синхронизируем трекеры.
+        """
+        try:
+            pid = int(parent_rule.get('id'))
+        except:
+            return  # не удалось прочитать id родителя
+        target = str(pid + 1)
+
+        # уже занято в прошлых/текущем запуске — ничего не делаем
+        if target in getattr(rules, "used_wazuh_ids", []) or target in getattr(rules, "used_wazuh_ids_this_run", []):
+            return
+
+        old = child_rule.get('id')
+        if old == target:
+            # уже как надо
+            return
+
+        # заменить id у правила
+        child_rule.set('id', target)
+
+        # обновить трек-карты
+        # убрать старый id из карт
+        if sigma_guid in rules.track_rule_ids and old in rules.track_rule_ids[sigma_guid]:
+            rules.track_rule_ids[sigma_guid].remove(old)
+        # добавить новый
+        rules.update_rule_id_mappings(sigma_guid, target)  # добавит, если нет
+        if old in rules.used_wazuh_ids_this_run:
+            rules.used_wazuh_ids_this_run.remove(old)
+        rules.used_wazuh_ids_this_run.append(target)
+        # подвинуть генератор id вперёд
+        try:
+            rules.rule_id = max(rules.rule_id, int(target))
+        except:
+            pass
+
     def build_logic_paths(self, rules, tokens, sigma_rule, sigma_rule_link):
         Notify.debug(self, "Function: {}".format(self.build_logic_paths.__name__))
         Notify.debug(self, "*" * 80)
@@ -1128,7 +1221,7 @@ class TrackSkips(object):
         #    skip = True
         #    self.one_of_and_skips += 1
         #    logic.append('more than 1_of with and')
-        # return skip, "{} {}".format(message, logic)
+        return skip, "{} {}".format(message, logic)
 
     def check_for_skip(self, rule, sigma_rule, detection, condition):
         """
@@ -1189,6 +1282,7 @@ class TrackSkips(object):
         print("-" * 55)
         print("                          Total Sigma rules: %s" % sigma_rules_count)
         print("                    Sigma rules converted %%: %s" % sigma_rules_converted_percent)
+        print("                    Fields without match %%: %s", missing_fields)
         print("*" * 75 + "\n\n")
 
 def arguments() -> argparse.ArgumentParser:
