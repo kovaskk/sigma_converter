@@ -1,20 +1,4 @@
 #!//usr/bin/python3
-"""
-    Author: Brian Kellogg
-
-    Purpose: Sigma to Wazuh rule converter.
-
-    References:
-        Sigma: https://github.com/SigmaHQ/sigma
-        Wazuh: https://wazuh.com
-
-    Complete parsing of Sigma logic is not implemented. Just simpler rules are converted presently.
-    Rules skipped:
-        - Any containing parentheses
-        - Any using Sigma near logic
-        - Any using a timeframe condition
-    Stats on all the above will be reported by this script.
-"""
 import argparse
 import collections
 import os
@@ -27,6 +11,27 @@ import yaml
 from ruamel.yaml import YAML
 
 debug = False
+
+class Var:
+    __slots__ = ("name", "neg")
+    def __init__(self, name, neg=False):
+        self.name = name
+        self.neg = neg
+    def __repr__(self): return f"{'not ' if self.neg else ''}{self.name}"
+
+class Node: pass
+class NVar(Node):
+    __slots__=("name",)
+    def __init__(self, name): self.name=name
+class NNot(Node):
+    __slots__=("x",)
+    def __init__(self, x): self.x=x
+class NAnd(Node):
+    __slots__=("l","r")
+    def __init__(self, l, r): self.l, self.r = l, r
+class NOr(Node):
+    __slots__=("l","r")
+    def __init__(self, l, r): self.l, self.r = l, r
 
 class Notify(object):
     def __init__(self):
@@ -316,20 +321,6 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         Notify.debug(self, "Function: {}".format(self.create_rule.__name__))
         level = sigma_rule['level']
         rule = self.init_rule(level, sigma_guid)
-        self.add_sigma_link_info(rule, sigma_rule_link)
-        # Add rule link and author
-        if 'author' in sigma_rule and sigma_rule['author'] is not None:
-            self.add_sigma_author(rule, sigma_rule['author'])
-        if 'description' in sigma_rule and sigma_rule['description'] is not None:
-            self.add_rule_comment(rule, "Description: " + sigma_rule['description'])
-        if 'date' in sigma_rule and sigma_rule['date'] is not None:
-            self.add_rule_comment(rule, "Date: " + str(sigma_rule['date']))
-        if 'status' in sigma_rule and sigma_rule['status'] is not None:
-            self.add_rule_comment(rule, "Status: " + sigma_rule['status'])
-        if 'id' in sigma_rule:
-            self.add_rule_comment(rule, "ID: " + sigma_rule['id'])
-        # if 'references' in sigma_rule:
-        #    self.add_sigma_rule_references(rule, sigma_rule['references'])
         if 'tags' in sigma_rule:
             self.add_mitre(rule, sigma_rule['tags'])
         self.add_description(rule, sigma_rule['title'])
@@ -358,6 +349,15 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         xml = re.sub(r'<id>\n\s+', r'<id>', xml)
         xml = re.sub(r'\s+</id>', r'</id>', xml)
 
+        xml = re.sub(r'<if_sid>\n\s+', r'<if_sid>', xml)
+        xml = re.sub(r'\s+</if_sid>', r'</if_sid>', xml)
+
+        xml = re.sub(r'<if_group>\n\s+', r'<if_group>', xml)
+        xml = re.sub(r'\s+</if_group>', r'</if_group>', xml)
+
+        xml = re.sub(r'<field(.+)>\n\s+', r'<field\1>', xml)
+        xml = re.sub(r'\s+</field>', r'</field>', xml)
+
         xml = re.sub(r'<description>\n\s+', r'<description>', xml)
         xml = re.sub(r'\s+</description>', r'</description>', xml)
 
@@ -367,19 +367,9 @@ All Sigma rules licensed under DRL: https://github.com/SigmaHQ/sigma/blob/master
         xml = re.sub(r'<group>\n\s+', r'<group>', xml)
         xml = re.sub(r'\s+</group>', r'</group>', xml)
 
-        xml = re.sub(r'<field(.+)>\n\s+', r'<field\1>', xml)
-        xml = re.sub(r'\s+</field>', r'</field>', xml)
-
         xml = re.sub(r'<info(.+)>\n\s+', r'<info\1>', xml)
         xml = re.sub(r'\s+</info>', r'</info>', xml)
 
-        xml = re.sub(r'<if_sid>\n\s+', r'<if_sid>', xml)
-        xml = re.sub(r'\s+</if_sid>', r'</if_sid>', xml)
-
-        xml = re.sub(r'<if_group>\n\s+', r'<if_group>', xml)
-        xml = re.sub(r'\s+</if_group>', r'</if_group>', xml)
-
-        # fixup some output messed up by the above
         xml = re.sub(r'</rule></group>', r'</rule>\n</group>', xml)
         xml = xml.replace('<?xml version="1.0" encoding="utf-8"?>\n', '')
 
@@ -811,53 +801,196 @@ class ParseSigmaRules(object):
             elif t == ')':
                 right_parens.append(i)
         if self.compare_lists(ors, ands):
-            self.reorder_tokens(tokens)        
+            self.reorder_tokens(tokens)
+
+    def _is_op(self, t):
+        return t in ("and", "or", "not", "(", ")")
+
+    def _collect_matches(self, detections: dict, prefix: str):
+        key = prefix.replace('*', '')
+        # исключаем служебный ключ 'condition'
+        return sorted([k for k in detections.keys() if k != 'condition' and k.startswith(key)])
+
+    def _expand_macros(self, tokens, detections: dict):
+        """ 1_of X* -> (X1 or X2 ...);  all_of X* -> (X1 and X2 ...) """
+        out = []
+        i = 0
+        n = len(tokens)
+        while i < n:
+            t = tokens[i]
+            tl = t.lower()
+            if tl in ("1_of", "all_of"):
+                if i + 1 >= n:
+                    out.append(t);
+                    i += 1;
+                    continue
+                mask = tokens[i + 1]
+                matches = self._collect_matches(detections, mask)
+                # если совпадений нет — оставим как есть (не должно, но безопасно)
+                if not matches:
+                    out.extend([t, mask]);
+                    i += 2;
+                    continue
+                out.append("(")
+                glue = "or" if tl == "1_of" else "and"
+                for j, m in enumerate(matches):
+                    out.append(m)
+                    if j + 1 < len(matches): out.append(glue)
+                out.append(")")
+                i += 2
+                continue
+            out.append(t)
+            i += 1
+        return out
+
+    def _to_ast(self, tokens):
+        """Шунтирующий двор: not > and > or; not — унарный."""
+        prec = {"or": 1, "and": 2, "not": 3}
+        right_assoc = {"not"}
+
+        def apply(op, stack):
+            if op == "not":
+                a = stack.pop();
+                stack.append(NNot(a))
+            else:
+                b = stack.pop();
+                a = stack.pop()
+                stack.append(NAnd(a, b) if op == "and" else NOr(a, b))
+
+        out, ops = [], []
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            tl = t.lower()
+            if t == "(":
+                ops.append(t)
+            elif t == ")":
+                while ops and ops[-1] != "(":
+                    apply(ops.pop(), out)
+                if ops and ops[-1] == "(": ops.pop()
+            elif tl in prec:
+                while ops and ops[-1] in prec and (
+                        prec[ops[-1]] > prec[tl] or (prec[ops[-1]] == prec[tl] and tl not in right_assoc)
+                ):
+                    apply(ops.pop(), out)
+                ops.append(tl)
+            else:
+                out.append(NVar(t))
+            i += 1
+        while ops:
+            apply(ops.pop(), out)
+        return out[0] if out else None
+
+    def _nnf(self, node):
+        """Протолкнуть not внутрь (ННФ)."""
+        if node is None: return None
+        if isinstance(node, NVar): return node
+        if isinstance(node, NNot):
+            x = node.x
+            if isinstance(x, NVar): return NNot(x)
+            if isinstance(x, NNot): return self._nnf(x.x)
+            if isinstance(x, NAnd): return self._nnf(NOr(NNot(x.l), NNot(x.r)))
+            if isinstance(x, NOr):  return self._nnf(NAnd(NNot(x.l), NNot(x.r)))
+        if isinstance(node, NAnd): return NAnd(self._nnf(node.l), self._nnf(node.r))
+        if isinstance(node, NOr):  return NOr(self._nnf(node.l), self._nnf(node.r))
+        return node
+
+    def _dnf(self, node):
+        """
+        Возвращает список конъюнкций; каждая конъюнкция — список Var(name,neg).
+        """
+
+        def litsets(n):
+            if isinstance(n, NVar): return [[Var(n.name, False)]]
+            if isinstance(n, NNot) and isinstance(n.x, NVar): return [[Var(n.x.name, True)]]
+            if isinstance(n, NOr):
+                return litsets(n.l) + litsets(n.r)
+            if isinstance(n, NAnd):
+                L, R = litsets(n.l), litsets(n.r)
+                out = []
+                for a in L:
+                    for b in R:
+                        out.append(a + b)
+                return out
+            # на этом этапе ННФ должна оставлять только Var / Not(Var) / And / Or
+            return [[]]
+
+        return litsets(node)
+
+    def _tokens_to_ast_dnf_paths(self, tokens, detections):
+        """
+        1) разворачиваем макросы 2) строим AST 3) NNF 4) DNF
+        5) DNF -> logic_paths формата, понятного handle_logic_paths
+        """
+        # распространить not на скобки перед разворачиванием макросов
+        tokens = self.propagate_nots(tokens)  # уже есть в коде
+        tokens = self._expand_macros(tokens, detections)  # 1_of/all_of -> or/and
+        ast = self._to_ast(tokens)
+        ast_nnf = self._nnf(ast)
+        conjs = self._dnf(ast_nnf)
+        logic_paths = []
+        for conj in conjs:
+            path = []
+            for lit in conj:
+                if lit.neg: path.append("not")
+                path.append(lit.name)
+            logic_paths.append(path)
+        return logic_paths
 
     def build_logic_paths(self, rules, tokens, sigma_rule, sigma_rule_link):
         Notify.debug(self, "Function: {}".format(self.build_logic_paths.__name__))
-        logic_paths = []        # we can have multiple paths for evaluating the sigma rule as Wazuh AND logic
-        path = []               # minimum logic for one AND path
-        negate = False
-        level = 0               # track paren nesting levels
-        is_or = False           # did we bump into an OR
-        is_and = False          # did we bump into an and
-        all_of = False          # handle "all of" directive
-        one_of = False          # handle "1 of" directive
-        ignore = False          # if exiting the token loop and "all_of" or "one_of" was the last processed don't add token to logic_paths
         Notify.debug(self, "*" * 80)
         Notify.debug(self, "Rule ID: " + sigma_rule['id'])
         Notify.debug(self, "Rule Link: " + sigma_rule_link)
-        Notify.debug(self, "Tokens: {}".format(tokens))
-        tokens = list(filter(None, tokens))  # remove all Null entries
-        tokens = self.reorder_one_ofs(tokens)
-        tokens = self.propagate_nots(tokens)
+        Notify.debug(self, "Tokens (raw): {}".format(tokens))
+
+        tokens = list(filter(None, tokens))
+        tokens = [t.strip() for t in tokens if t.strip()]
+
+        # если встречается 1_of/all_of — используем новый путь на базе ДНФ
+        if any(t.lower() in ("1_of", "all_of") for t in tokens):
+            logic_paths = self._tokens_to_ast_dnf_paths(tokens, sigma_rule['detection'])
+            Notify.debug(self, "Logic Paths (DNF): {}".format(logic_paths))
+            return self.handle_logic_paths(rules, sigma_rule, sigma_rule_link, logic_paths)
+
+        # fallback: старый путь без макросов
+        tokens = self.propagate_nots(self.reorder_one_ofs(tokens))
+        logic_paths = []
+        path = []
+        negate = False
+        level = 0
+        is_or = False
+        is_and = False
+        all_of = False
+        one_of = False
+        ignore = False
+
         for t in tokens:
             if t.lower() == 'not':
-                negate = True
+                negate = True;
                 continue
             if t == '(':
-                level += 1
+                level += 1;
                 continue
             if t == ')':
-                level -= 1
+                level -= 1;
                 continue
             if t.lower() == 'or':
-                is_or = True
+                is_or = True;
                 continue
             if t.lower() == 'and':
-                is_or = False
-                is_and = True
+                is_or = False;
+                is_and = True;
                 continue
             if all_of:
                 path.extend(self.handle_all_of(sigma_rule['detection'], t))
-                ignore = True
-                all_of = False
+                ignore = True;
+                all_of = False;
                 continue
             if one_of:
-                # one_of logic parsing is an utter kludge (e.g. what if 1_of comes at the beginning of condition followed by more logic?)
                 paths = self.handle_one_of(sigma_rule['detection'], t, path, negate)
-                ignore = True
-                logic_paths.extend(paths)
+                ignore = True;
+                logic_paths.extend(paths);
                 continue
             if is_or and not negate:
                 logic_paths.append(path)
@@ -866,7 +999,7 @@ class ParseSigmaRules(object):
                 elif (len(path) > 1) and (path[-1] != 'not'):
                     path = path[:-1]
             if t.lower() == '1_of':
-                one_of = True
+                one_of = True;
                 continue
             if negate:
                 if path and path[-1] != 'not':
@@ -874,26 +1007,16 @@ class ParseSigmaRules(object):
                 elif not path:
                     path.append('not')
             if t.lower() == 'all_of':
-                all_of = True
+                all_of = True;
                 continue
             path.append(t)
             negate = False
             ignore = False
-            Notify.debug(self, "Logic Path: {}".format(path))
         if path and not ignore:
-            Notify.debug(self, "Logic Path: {}".format(path))
             logic_paths.append(path)
-        Notify.debug(self, "Logic Paths: {}".format(logic_paths))
-        self.handle_logic_paths(rules, sigma_rule, sigma_rule_link, logic_paths)
 
-    # def build_logic(self, rules, tokens, sigma_rule, sigma_rule_link):
-    #     logic = {
-    #         'negate': False,
-    #         'terms': []
-    #     }
-    #     logics = []
-    #     for t in tokens:
-    #         pass
+        Notify.debug(self, "Logic Paths (legacy): {}".format(logic_paths))
+        self.handle_logic_paths(rules, sigma_rule, sigma_rule_link, logic_paths)
 
 
 class TrackSkips(object):
