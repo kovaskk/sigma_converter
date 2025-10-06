@@ -234,10 +234,18 @@ class BuildRules(object):
 
     def add_mitre(self, rule, tags):
         Notify.debug(self, "Function: {}".format(self.add_mitre.__name__))
+        pat = re.compile(r'(?i)\bT\d{4}(?:\.\d{3})?\b')  # техника или подтехника
         mitre = SubElement(rule, 'mitre')
+        seen = set()
         for t in tags:
-            mitre_id = SubElement(mitre, 'id')
-            mitre_id.text = t
+            m = pat.search(str(t))
+            if not m:
+                continue
+            tid = m.group(0).upper()
+            if tid in seen:
+                continue
+            SubElement(mitre, 'id').text = tid
+            seen.add(tid)
 
     def add_sigma_link_info(self, rule, sigma_rule_link):
         Notify.debug(self, "Function: {}".format(self.add_sigma_link_info.__name__))
@@ -829,6 +837,7 @@ class ParseSigmaRules(object):
                                        product)
 
                 self._merge_same_field_nodes(child)
+                rules.finalize_rule(child, sigma_rule, omit_mitre=True)
             return
 
         # Fallback (нестандартные выражения) — старая ветка
