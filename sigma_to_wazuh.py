@@ -247,6 +247,18 @@ class BuildRules(object):
             SubElement(mitre, 'id').text = tid
             seen.add(tid)
 
+    def add_pre_rule_comment(self, rule, text: str | None):
+        """Вставить комментарий с description перед самим <rule>."""
+        msg = (text or "").replace('--', ' - ')
+        comment = Comment(msg)
+        parent = self.root  # правила лежат прямо под корнем <group>
+        try:
+            idx = list(parent).index(rule)  # позиция текущего <rule> среди детей root
+        except ValueError:
+            parent.append(comment)
+            return
+        parent.insert(idx, comment)
+
     def add_sigma_link_info(self, rule, sigma_rule_link):
         Notify.debug(self, "Function: {}".format(self.add_sigma_link_info.__name__))
         link = SubElement(rule, 'info')
@@ -373,7 +385,7 @@ class BuildRules(object):
 
     def finalize_rule(self, rule, sigma_rule, omit_mitre=False):
         self.add_options(rule, sigma_rule['level'], sigma_rule['id'])
-        self.add_rule_comment(rule, f"{sigma_rule.get('description')}")
+        self.add_pre_rule_comment(rule, sigma_rule.get('description'))
         self.add_description(rule, sigma_rule['title'])
         if (not omit_mitre) and ('tags' in sigma_rule):
             self.add_mitre(rule, sigma_rule['tags'])
