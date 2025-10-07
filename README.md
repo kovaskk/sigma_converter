@@ -18,7 +18,7 @@ Run sigma_to_wazuh.py
 
 1. Change rule location directory in `config.ini`
 2. Run the sigma_to_wazuh.py.
-    2.1. If converter skipped some rules, checkout the output in the cli.
+    2.1. If converter has skipped some rules, checkout the output in the cli.
 4. Run the normalize_nums.py to perform ids normalization from start id.
 5. You can find converted rules in `sigma.xml`
 
