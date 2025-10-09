@@ -1,6 +1,6 @@
 # sigma_to_wazuh
-Convert Sigma rules to Wazuh rules
-
+Convert Sigma rules to Wazuh rules. This is the overwritted project of existed 
+This is a reworked version of an existing converter, which can be found at the link: https://github.com/theflakes/sigma_to_wazuh
 ## How to:
 Clone repository.  
 
