@@ -23,6 +23,3 @@ def renumber_rule_ids(path_in: str, path_out: str | None = None, start_id: int =
     out = path_out or path_in
     tree.write(out, encoding="utf-8", xml_declaration=True, pretty_print=False)
     return changed
-
-id_start = int(input("Введите стартовый id правила: "))
-renumber_rule_ids("sigma.xml", "sigma.xml", start_id=id_start)

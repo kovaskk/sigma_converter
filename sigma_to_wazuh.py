@@ -1,6 +1,5 @@
 #!//usr/bin/python3
 import argparse
-import collections
 import os
 import configparser
 import bs4, re
@@ -9,6 +8,8 @@ import base64
 from xml.etree.ElementTree import Element, SubElement, Comment, tostring
 import yaml
 from ruamel.yaml import YAML
+
+import normalize_nums
 
 debug = False
 
@@ -64,18 +65,11 @@ class BuildRules(object):
         self.rule_id_start = int(self.config.get('options', 'rule_id_start'))
         self.rule_id = self.rule_id_start
         self.out_file = self.config.get('sigma', 'out_file')
-        self.track_rule_ids_file = self.config.get('options','rule_id_file')  # file that stores Sigma GUID to Wazuh rule ID mappings
-        self.track_rule_ids = self.load_wazuh_to_sigma_id_mappings()  # in memory Dict of self.track_rule_ids_file contents
-        self.used_wazuh_ids = self.get_used_wazuh_rule_ids()  # used Wazuh rule IDs used in previous runs
-        self.used_wazuh_ids_this_run = []  # new Wazuh rule IDs consummed this run
-        # скорректировать стартовый счётчик rule_id по фактическому максимуму
-        try:
-            # used_wazuh_ids — строки, переводим в int и берём максимум
-            _max_used = max([int(x) for x in self.used_wazuh_ids]) if self.used_wazuh_ids else (self.rule_id_start - 1)
-        except Exception:
-            _max_used = self.rule_id_start - 1
-        # find_unused_rule_id делает self.rule_id += 1, поэтому держим «предыдущее»
-        self.rule_id = max(self.rule_id_start - 1, _max_used)
+        self.track_rule_ids_file = self.config.get('options','rule_id_file')
+        self.track_rule_ids = self.load_wazuh_to_sigma_id_mappings()
+        self.used_wazuh_ids = self.get_used_wazuh_rule_ids()
+        self.used_wazuh_ids_this_run = []
+        self.rule_id = self.rule_id_start
         self.root = self.create_root()
         self.rule_count = 0
         self.full_log_hits = []
@@ -127,7 +121,7 @@ class BuildRules(object):
 
     def find_unused_rule_id(self, sigma_guid):
         """
-            Lets make sure we use a Wazuh rule ID not already assigned to a Sigma GUID
+            Проверка, что Wazuh rule ID не конфликтует с Sigma GUID
         """
         Notify.debug(self, "Function: {}".format(self.find_unused_rule_id.__name__))
         while True:
@@ -140,8 +134,7 @@ class BuildRules(object):
 
     def find_wazuh_id(self, sigma_guid):
         """
-            Has this Sigma rule already been converted and assigned a Wazuh rule ID?
-            If so, we need to keep it the same.
+            Проверка на то, было ли уже данное правило сконвертировано в формат Wazuh'а
         """
         Notify.debug(self, "Function: {}".format(self.find_wazuh_id.__name__))
         if sigma_guid in self.track_rule_ids:
@@ -169,11 +162,8 @@ class BuildRules(object):
         return "full_log" # target full log if we cannot find the field
 
     def if_ends_in_space(self, value, is_b64):
-        """
-            spaces at end of logic are being chopped, therefore hacking this fix
-        """
         Notify.debug(self, "Function: {}".format(self.if_ends_in_space.__name__))
-        if value.startswith('(?i)'):  # if value start with this, it is a Sigma regex, remove it as it will be added again
+        if value.startswith('(?i)'):
             value = value[4:]
         if value.endswith(' '):
             value = '(?:' + value + ')'
@@ -182,9 +172,6 @@ class BuildRules(object):
         return '(?i)' + value
 
     def handle_full_log_field(self, value):
-        """
-            We do not want to honor Sigma startswith and endswith logic if we use the full_log field
-        """
         Notify.debug(self, "Function: {}".format(self.handle_full_log_field.__name__))
         if value.startswith('^'):
             value = value[1:]
@@ -202,8 +189,6 @@ class BuildRules(object):
         logic.set('negate', negate)
         logic.set('type', 'pcre2')
         value = str(value).replace(r'\?', r'.')
-        # Нормализация обратных слешей для путей: каждый `\\` → `\\\\`
-        # (Sigma/YAML часто уже даёт удвоенные слеши; доводим до четверных)
         value = re.sub(r'\\\\', r'\\\\\\\\', value)
         if name == 'full_log':
             final_text = self.if_ends_in_space(self.handle_full_log_field(value), is_b64).replace(r'\*', r'.+')
@@ -234,7 +219,7 @@ class BuildRules(object):
 
     def add_mitre(self, rule, tags):
         Notify.debug(self, "Function: {}".format(self.add_mitre.__name__))
-        pat = re.compile(r'(?i)\bT\d{4}(?:\.\d{3})?\b')  # техника или подтехника
+        pat = re.compile(r'(?i)\bT\d{4}(?:\.\d{3})?\b')
         mitre = SubElement(rule, 'mitre')
         seen = set()
         for t in tags:
@@ -248,12 +233,11 @@ class BuildRules(object):
             seen.add(tid)
 
     def add_pre_rule_comment(self, rule, text: str | None):
-        """Вставить комментарий с description перед самим <rule>."""
         msg = (text or "").replace('--', ' - ')
         comment = Comment(msg)
-        parent = self.root  # правила лежат прямо под корнем <group>
+        parent = self.root
         try:
-            idx = list(parent).index(rule)  # позиция текущего <rule> среди детей root
+            idx = list(parent).index(rule)
         except ValueError:
             parent.append(comment)
             return
@@ -400,7 +384,6 @@ class BuildRules(object):
         Notify.debug(self, "Function: {}".format(self.write_rules_file.__name__))
         xml = bs4.BeautifulSoup(tostring(self.root), 'xml').prettify()
 
-        # collapse some tags to single lines
         xml = re.sub(r'<id>\n\s+', r'<id>', xml)
         xml = re.sub(r'\s+</id>', r'</id>', xml)
 
@@ -482,8 +465,7 @@ class ParseSigmaRules(object):
 
     def fixup_condition(self, condition):
         """
-            Replace spaces with _ when the words constitute a logic operation.
-            Allows for easier tokenization.
+            Замена пробелов в условиях на "_".
         """
         Notify.debug(self, "Function: {}".format(self.fixup_condition.__name__))
         if isinstance(condition, list):
@@ -510,15 +492,12 @@ class ParseSigmaRules(object):
             rules.track_rule_ids[sid].remove(wid)
         if wid in rules.used_wazuh_ids_this_run:
             rules.used_wazuh_ids_this_run.remove(wid)
-        rules.rule_count -= 1  # decrement count of rules created
-        rules.root.remove(rule)  # destroy the extra rule that is created
+        rules.rule_count -= 1
+        rules.root.remove(rule)
 
     def fixup_logic(self, logic, is_regex):
         Notify.debug(self, "Function: {}".format(self.fixup_logic.__name__))
         logic = str(logic)
-        # if len(logic) > 2:  # when converting to Wazuh pcre2 expressions, we don't need start and end wildcards
-        #     if logic[0] == '*': logic = logic[1:]
-        #     if logic[-1] == '*': logic = logic[:-1]
         if is_regex:
             return logic
         else:
@@ -549,7 +528,6 @@ class ParseSigmaRules(object):
             if field is None or logic is None:
                 continue
             self.is_dict_list_or_not(logic, rules, rule, sigma_rule, sigma_rule_link, product, field, negate, is_b64)
-        # НИЧЕГО не возвращаем и НЕ создаём новое правило здесь
 
     def is_dict_list_or_not(self, logic, rules, rule, sigma_rule, sigma_rule_link, product, field, negate, is_b64):
         Notify.debug(self, "Function: {}".format(self.is_dict_list_or_not.__name__))
@@ -576,9 +554,6 @@ class ParseSigmaRules(object):
         return values
 
     def handle_detection_nested_lists(self, values, record, key, value):
-        """
-            We can run into lists at various depths in Sigma deteciton logic.
-        """
         Notify.debug(self, "Function: {}".format(self.handle_detection_nested_lists.__name__))
         values = []
         if not key.endswith('|all'):
@@ -607,19 +582,15 @@ class ParseSigmaRules(object):
 
         det = detection[token]
 
-        # список словарей: каждый dict — альтернатива selection'а
         if isinstance(det, list) and all(isinstance(x, dict) for x in det):
             return det
 
-        # один словарь: единственная альтернатива
         if isinstance(det, dict):
             return [det]
 
-        # список простых значений: упаковать в dict {token: [..]}
         if isinstance(det, list):
             return [{token: det}]
 
-        # одиночное значение: упаковать в dict {token: value}
         return [{token: det}]
 
     def get_product(self, sigma_rule):
@@ -650,7 +621,6 @@ class ParseSigmaRules(object):
 
     def handle_or_to_and(self, value, negate, contains_all, start, end, is_regex, exact_match):
         Notify.debug(self, "Function: {}".format(self.handle_or_to_and.__name__))
-        # точное совпадение – через handle_list (даёт ^...$)
         if exact_match:
             return self.handle_list(value, False, False, is_regex, exact_match)
 
@@ -660,9 +630,7 @@ class ParseSigmaRules(object):
         if isinstance(value, list):
             wrapped = [wrap(v) for v in value]
             if (negate == "yes" or contains_all):
-                # AND: каждый элемент – отдельный <field>
                 return wrapped
-            # OR: одна строка логики на поле
             return "|".join(wrapped)
         return wrap(value)
 
@@ -677,18 +645,10 @@ class ParseSigmaRules(object):
         return value
 
     def convert_transforms(self, key, value, negate, rules, product):
-        """
-            Parse Sigma modifiers order-independently:
-            supports contains/startswith/endswith/re + (all|windash|base64|base64offset).
-        """
         Notify.debug(self, "Function: {}".format(self.convert_transforms.__name__))
-
-        # нет модификаторов — старое поведение ниже
-        # нет модификаторов — старая ветка
         if '|' not in key:
             field = key
             fl = field.lower()
-            # жёсткий фильтр служебных ключей детектов
             if fl.startswith('selection_') or fl.startswith('filter_') or fl == 'condition':
                 return None, None, False
 
@@ -709,28 +669,20 @@ class ParseSigmaRules(object):
         is_b64 = ('base64' in mods) or ('base64offset' in mods)
         b64_offset = ('base64offset' in mods)
 
-        # основная операция (первая найденная из списка)
         op = None
         for cand in ('contains', 'startswith', 'endswith', 're'):
             if cand in mods:
                 op = cand
                 break
         if op is None:
-            # по умолчанию трактуем как contains
             op = 'contains'
 
         fl = field.lower()
         if fl.startswith('selection_') or fl.startswith('filter_') or fl == 'condition':
             return None, None, is_b64
-
-        # windash = предварительная подмена '-' -> '[/-]' и ИСПОЛЬЗУЕМ regex
         if has_windash:
             value = self.handle_windash(value)
         is_regex = (op == 're') or has_windash
-
-        # base64-модификаторы влияют только на представление значения
-        # (handle_list использует is_b64/b64_offset)
-        # Для contains/startswith/endswith/exact мы не включаем exact_match
 
         if op == 'contains' or op == 're':
             return field, self.handle_or_to_and(value, negate, has_all, '', '', is_regex, False), is_b64
@@ -766,15 +718,14 @@ class ParseSigmaRules(object):
     def handle_logic_paths(self, rules, sigma_rule, sigma_rule_link, logic_paths):
         """
         Один родитель:
-          - '1 of selection_*' → значения схлопываются в OR внутри полей;
-          - 'all of selection_*' → поля добавляются как AND.
+          - '1 of selection_*' - значения схлопываются в OR внутри полей;
+          - 'all of selection_*' - поля добавляются как AND.
         Один дочерний (level=0) с if_sid на единственный родитель. Фильтры только из filter_*.
         """
         from xml.etree.ElementTree import Element
 
         product = self.get_product(sigma_rule)
 
-        # Собираем по всем путям DNF
         all_paths = []  # [(base_terms, filter_terms)]
         for path in logic_paths:
             base_terms, filter_terms, negate_next = [], [], False
@@ -791,7 +742,6 @@ class ParseSigmaRules(object):
                 negate_next = False
             all_paths.append((base_terms, filter_terms))
 
-        # Эвристика формы
         is_one_of = (len(all_paths) >= 1 and all(len(bt) == 1 and bt[0][1] == "no" for bt, _ in all_paths))
         is_all_of = (len(all_paths) == 1 and len(all_paths[0][0]) >= 2 and all(
             neg == "no" for _, neg in all_paths[0][0]))
@@ -802,7 +752,7 @@ class ParseSigmaRules(object):
             parent = rules.create_rule(sigma_rule, sigma_rule_link, sigma_rule['id'])
 
             if is_one_of:
-                # все selection_* из всех путей → OR по одинаковым полям
+                # все selection_* из всех путей - OR по одинаковым полям
                 selection_tokens = [bt[0][0] for bt, _ in all_paths]
                 det_variants = []
                 for tok in selection_tokens:
@@ -812,7 +762,7 @@ class ParseSigmaRules(object):
                     self.is_dict_list_or_not(logic, rules, parent, sigma_rule, sigma_rule_link, product, field, "no",
                                              is_b64)
             else:
-                # all_of: каждый selection_* → сначала OR внутри поля, затем поля добавляем (AND)
+                # all_of: каждый selection_* - сначала OR внутри поля, затем поля добавляем (AND)
                 selection_tokens = [t for (t, _) in all_paths[0][0]]
                 for tok in selection_tokens:
                     merged = self._merge_or_variants(self._token_variants(sigma_rule, tok), "no", rules, product)
@@ -824,7 +774,7 @@ class ParseSigmaRules(object):
             parent_rules.append(parent)
             parent_ids.append(parent.get('id'))
 
-            # Фильтры (только filter_*) → один дочерний
+            # Фильтры (только filter_*) - один дочерний
             all_filters = []
             for _, ft in all_paths:
                 for x in ft:
@@ -833,7 +783,6 @@ class ParseSigmaRules(object):
 
             if all_filters:
                 child = rules.create_child_rule(sigma_rule, sigma_rule_link, sigma_rule['id'], parent)
-                # id(child) = id(parent)+1 (если возможно)
                 try:
                     self._ensure_child_id_consecutive(rules, parent, child, sigma_rule['id'])
                 except Exception:
@@ -852,7 +801,6 @@ class ParseSigmaRules(object):
                 rules.finalize_rule(child, sigma_rule, omit_mitre=True)
             return
 
-        # Fallback (нестандартные выражения) — старая ветка
         for path in logic_paths:
             base_terms, filter_terms, negate_next = [], [], False
             for p in path:
@@ -982,7 +930,6 @@ class ParseSigmaRules(object):
     def compare_lists(self, list1, list2):
         Notify.debug(self, "Function: {}".format(self.compare_lists.__name__))
         for num2 in list2:
-            # If the number is less than any number in the first list, return True
             if any(num1 > num2 for num1 in list1):
                 return True
         return False
@@ -1010,16 +957,12 @@ class ParseSigmaRules(object):
 
     def _collect_matches(self, detections: dict, prefix: str):
         key = prefix.replace('*', '')
-        # исключаем служебный ключ 'condition'
         return sorted([k for k in detections.keys() if k != 'condition' and k.startswith(key)])
 
     def _token_variants(self, sigma_rule, token):
-        """Вернуть список альтернатив для токена: OR на уровне selection."""
         det = sigma_rule['detection'][token]
-        # Список словарей => каждая запись — самостоятельная альтернатива
         if isinstance(det, list) and all(isinstance(x, dict) for x in det):
             return det
-        # Прочее — единственный вариант (оставляем как есть)
         return [det]
 
     def _dedup_preserve(self, items):
@@ -1033,7 +976,6 @@ class ParseSigmaRules(object):
         return out
 
     def _variant_items(self, d, negate, rules, product):
-        """Один вариант selection -> список (field, logic, negate, is_b64)."""
         items = []
         for k, v in d.items():
             field, logic, is_b64 = self.convert_transforms(k, v, negate, rules, product)
@@ -1057,15 +999,12 @@ class ParseSigmaRules(object):
             for field, logic, is_b64 in ((fi, lo, ib) for fi, lo, _, ib in
                                          self._variant_items(d, negate, rules, product)):
                 if isinstance(logic, list):
-                    # это уже AND-элементы для этого поля
                     bucket[field]["lists"].extend(logic)
                 else:
                     bucket[field]["strings"].append(logic)
-                # если где-то встретился is_b64=True — унаследуем его
                 bucket[field]["is_b64"] = bucket[field]["is_b64"] or is_b64
 
         merged = []
-        # ВАЖНО: внутри одного selection (один вариант) не склеиваем строки в OR
         combine_strings = len(det_variants) > 1
 
         for field, b in bucket.items():
@@ -1073,22 +1012,18 @@ class ParseSigmaRules(object):
 
             if strs:
                 if combine_strings and len(strs) > 1:
-                    # кейс "1 of ..." и т.п. — OR между строками
                     combined = "(?:" + ")|(?:".join(strs) + ")"
                     merged.append((field, combined, negate, b["is_b64"] or False))
                 else:
-                    # один selection — каждая строка отдельным полем (AND)
                     for s in strs:
                         merged.append((field, s, negate, b["is_b64"] or False))
 
-            # элементы из contains|all уже идут как список — добавляем как AND
             for l in b["lists"]:
                 merged.append((field, l, negate, b["is_b64"] or False))
 
         return merged
 
     def _expand_macros(self, tokens, detections: dict):
-        """ 1_of X* -> (X1 or X2 ...);  all_of X* -> (X1 and X2 ...) """
         out = []
         i = 0
         n = len(tokens)
@@ -1102,7 +1037,6 @@ class ParseSigmaRules(object):
                     continue
                 mask = tokens[i + 1]
                 matches = self._collect_matches(detections, mask)
-                # если совпадений нет — оставим как есть (не должно, но безопасно)
                 if not matches:
                     out.extend([t, mask]);
                     i += 2;
@@ -1120,7 +1054,7 @@ class ParseSigmaRules(object):
         return out
 
     def _to_ast(self, tokens):
-        """Шунтирующий двор: not > and > or; not — унарный."""
+        """not > and > or; not — унарный."""
         prec = {"or": 1, "and": 2, "not": 3}
         right_assoc = {"not"}
 
@@ -1158,7 +1092,6 @@ class ParseSigmaRules(object):
         return out[0] if out else None
 
     def _nnf(self, node):
-        """Протолкнуть not внутрь (ННФ)."""
         if node is None: return None
         if isinstance(node, NVar): return node
         if isinstance(node, NNot):
@@ -1173,7 +1106,7 @@ class ParseSigmaRules(object):
 
     def _dnf(self, node):
         """
-        Возвращает список конъюнкций; каждая конъюнкция — список Var(name,neg).
+        Возвращает список конъюнкций; каждая конъюнкция - список Var(name,neg).
         """
 
         def litsets(n):
@@ -1188,7 +1121,6 @@ class ParseSigmaRules(object):
                     for b in R:
                         out.append(a + b)
                 return out
-            # на этом этапе ННФ должна оставлять только Var / Not(Var) / And / Or
             return [[]]
 
         return litsets(node)
@@ -1196,11 +1128,10 @@ class ParseSigmaRules(object):
     def _tokens_to_ast_dnf_paths(self, tokens, detections):
         """
         1) разворачиваем макросы 2) строим AST 3) NNF 4) DNF
-        5) DNF -> logic_paths формата, понятного handle_logic_paths
+        5) DNF - logic_paths формата, понятного handle_logic_paths
         """
-        # распространить not на скобки перед разворачиванием макросов
-        tokens = self.propagate_nots(tokens)  # уже есть в коде
-        tokens = self._expand_macros(tokens, detections)  # 1_of/all_of -> or/and
+        tokens = self.propagate_nots(tokens)
+        tokens = self._expand_macros(tokens, detections)
         ast = self._to_ast(tokens)
         ast_nnf = self._nnf(ast)
         conjs = self._dnf(ast_nnf)
@@ -1214,7 +1145,6 @@ class ParseSigmaRules(object):
         return logic_paths
 
     def _strip_if_sid(self, rule):
-        # удалить все автоматически добавленные if_sid (и у родителя, и у ребёнка)
         if rule is None:
             return
         for e in list(rule):
@@ -1228,31 +1158,23 @@ class ParseSigmaRules(object):
         try:
             pid = int(parent_rule.get('id'))
         except:
-            return  # не удалось прочитать id родителя
+            return
         target = str(pid + 1)
 
-        # уже занято в прошлых/текущем запуске — ничего не делаем
         if target in getattr(rules, "used_wazuh_ids", []) or target in getattr(rules, "used_wazuh_ids_this_run", []):
             return
 
         old = child_rule.get('id')
         if old == target:
-            # уже как надо
             return
 
-        # заменить id у правила
         child_rule.set('id', target)
-
-        # обновить трек-карты
-        # убрать старый id из карт
         if sigma_guid in rules.track_rule_ids and old in rules.track_rule_ids[sigma_guid]:
             rules.track_rule_ids[sigma_guid].remove(old)
-        # добавить новый
-        rules.update_rule_id_mappings(sigma_guid, target)  # добавит, если нет
+        rules.update_rule_id_mappings(sigma_guid, target)
         if old in rules.used_wazuh_ids_this_run:
             rules.used_wazuh_ids_this_run.remove(old)
         rules.used_wazuh_ids_this_run.append(target)
-        # подвинуть генератор id вперёд
         try:
             rules.rule_id = max(rules.rule_id, int(target))
         except:
@@ -1268,7 +1190,7 @@ class ParseSigmaRules(object):
 
         per_token = []
         for token, neg in base_terms:
-            variants = self._token_variants(sigma_rule, token)  # список dict-вариантов
+            variants = self._token_variants(sigma_rule, token)
             norm = []
             for v in variants:
                 norm.append(v if isinstance(v, dict) else {token: v})
@@ -1282,8 +1204,7 @@ class ParseSigmaRules(object):
             for combo in itertools.product(*only_variant_lists):
                 parent_rule = rules.create_rule(sigma_rule, sigma_rule_link, sigma_rule['id'])
 
-                # разделяем по negate и схлопываем OR по одинаковым полям
-                by_neg = collections.defaultdict(list)  # neg -> [dict-вариант]
+                by_neg = collections.defaultdict(list)
                 for (token, neg, _), variant_dict in zip(per_token, combo):
                     by_neg[neg].append(variant_dict)
 
@@ -1305,9 +1226,6 @@ class ParseSigmaRules(object):
         В дочернем правиле объединяет все дубликаты <field name="..."> так,
         чтобы ВЕСЬ их текст учитывался. Группируем по (name, negate, type).
         Тексты объединяются через безопасное '(?:... )|(?: ...)'.
-
-        Важно: это вызывается ТОЛЬКО для дочерних правил (filters), поэтому
-        объединение через OR не ломает семантику selection'ов.
         """
         from collections import defaultdict
 
@@ -1330,7 +1248,6 @@ class ParseSigmaRules(object):
             texts = []
             seen = set()
 
-            # Собираем все тексты, сохраняем порядок, убираем дубли
             for n in nodes:
                 t = (n.text or '').strip()
                 if not t:
@@ -1340,7 +1257,7 @@ class ParseSigmaRules(object):
                     texts.append(t)
 
             if not texts:
-                # нет содержимого — просто удалим дубли
+
                 for n in nodes[1:]:
                     rule_elem.remove(n)
                 continue
@@ -1348,10 +1265,8 @@ class ParseSigmaRules(object):
             if len(texts) == 1:
                 primary.text = texts[0]
             else:
-                # Каждую альтернативу оборачиваем в (?:...), затем объединяем через |
                 primary.text = '(?:' + ')|(?:'.join(texts) + ')'
 
-            # Удаляем остальные одноимённые поля
             for n in nodes[1:]:
                 rule_elem.remove(n)
 
@@ -1365,13 +1280,11 @@ class ParseSigmaRules(object):
         tokens = list(filter(None, tokens))
         tokens = [t.strip() for t in tokens if t.strip()]
 
-        # если встречается 1_of/all_of — используем новый путь на базе ДНФ
         if any(t.lower() in ("1_of", "all_of") for t in tokens):
             logic_paths = self._tokens_to_ast_dnf_paths(tokens, sigma_rule['detection'])
             Notify.debug(self, "Logic Paths (DNF): {}".format(logic_paths))
             return self.handle_logic_paths(rules, sigma_rule, sigma_rule_link, logic_paths)
 
-        # fallback: старый путь без макросов
         tokens = self.propagate_nots(self.reorder_one_ofs(tokens))
         logic_paths = []
         path = []
@@ -1527,12 +1440,7 @@ class TrackSkips(object):
             skip = True
             self.near_skips += 1
             logic.append('Near')
-        # if (condition.count('(') > 1 and ' or ' in condition) or (
-        #         not ') or (' in condition and condition.count('(') == 2):
-        #     skip = True
-        #     self.paren_skips += 1
-        #     logic.append('Paren')
-        detection_string = yaml.dump(detection) # need to search it as string
+        detection_string = yaml.dump(detection)
         if 'timeframe' in detection_string:
             skip = True
             self.timeframe_skips += 1
@@ -1541,11 +1449,6 @@ class TrackSkips(object):
             skip = True
             self.cidr += 1
             logic.append('Cidr')
-        # one_of_count = condition.lower().split().count('1_of') # filter out rules with multiple 1_of's
-        # if (one_of_count > 1 and 'and' in condition) or ("not 1_of" in condition):
-        #    skip = True
-        #    self.one_of_and_skips += 1
-        #    logic.append('more than 1_of with and')
         return skip, "{} {}".format(message, logic)
 
     def check_for_skip(self, rule, sigma_rule, detection, condition):
@@ -1574,16 +1477,14 @@ class TrackSkips(object):
         with open(self.wazuh_rules_file, 'r', encoding="utf8") as file:
             content = file.read()
 
-            # Search for all occurrences of text between <!--ID: and -->
             import re
             pattern = r'<!--ID: (.*?)-->'
             matches = re.findall(pattern, content)
 
-            # Add unique IDs to the set
-            for match in matches:
-                unique_ids.add(match.strip())  # Remove leading/trailing spaces
 
-        # Return the total count of unique IDs
+            for match in matches:
+                unique_ids.add(match.strip())
+
         return len(unique_ids)
 
     def report_stats(self, error_count, wazuh_rules_count, sigma_rules_count):
@@ -1643,30 +1544,28 @@ def main():
 
         try:
             conditions = convert.fixup_condition(sigma_rule['detection']['condition'])
-            #notify.debug(conditions)
         except:
-            #notify.debug(conditions)
             continue
 
         skip_rule = stats.check_for_skip(rule, sigma_rule, sigma_rule['detection'], conditions)
         if skip_rule:
             continue
-        #notify.debug(rule)
 
-        # build the URL to the sigma rule, handle relative paths
         partial_url_path = rule.replace('/sigma/rules', '').replace('../', '/').replace('./', '/').replace('\\','/').replace('..', '')
 
         if isinstance(conditions, list):
-            for condition in conditions:  # create new rule for each condition, needs work
+            for condition in conditions:
                 tokens = condition.strip().split(' ')
                 convert.build_logic_paths(wazuh_rules, tokens, sigma_rule, partial_url_path)
             continue
         tokens = conditions.strip().split(' ')
         convert.build_logic_paths(wazuh_rules, tokens, sigma_rule, partial_url_path)
 
-    # write out all Wazuh rules created
     wazuh_rules.write_rules_file()
     stats.report_stats(convert.error_count, wazuh_rules.rule_count, len(sigma_rule_ids))
+    normalize_nums.renumber_rule_ids()
+    id_start = int(input("Введите стартовый id правила: "))
+    normalize_nums.renumber_rule_ids("sigma.xml", "sigma.xml", start_id=id_start)
 
 
 if __name__ == "__main__":
