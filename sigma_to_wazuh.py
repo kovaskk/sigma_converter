@@ -1,6 +1,5 @@
 #!//usr/bin/python3
 import argparse
-import collections
 import os
 import configparser
 import bs4, re
@@ -9,6 +8,8 @@ import base64
 from xml.etree.ElementTree import Element, SubElement, Comment, tostring
 import yaml
 from ruamel.yaml import YAML
+
+import normalize_nums
 
 debug = False
 
@@ -1562,6 +1563,9 @@ def main():
 
     wazuh_rules.write_rules_file()
     stats.report_stats(convert.error_count, wazuh_rules.rule_count, len(sigma_rule_ids))
+    normalize_nums.renumber_rule_ids()
+    id_start = int(input("Введите стартовый id правила: "))
+    normalize_nums.renumber_rule_ids("sigma.xml", "sigma.xml", start_id=id_start)
 
 
 if __name__ == "__main__":
